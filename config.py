@@ -4,7 +4,7 @@ from ollama import Client
 
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "https://ollama.com")
 OLLAMA_API_KEY = os.environ.get("OLLAMA_API_KEY", "")
-MODEL_NAME = os.environ.get("VLM_MODEL", "gemma4:31b")
+MODEL_NAME = os.environ.get("VLM_MODEL", "qwen3.5:cloud")
 
 STAC_API_URL = "https://earth-search.aws.element84.com/v1"
 STAC_COLLECTION = "sentinel-2-l2a"

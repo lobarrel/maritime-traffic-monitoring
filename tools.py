@@ -131,12 +131,14 @@ def explore_direction(
         f"1. Is this area water, a canal, land, coastline, or a mix?\n"
         f"2. Count and describe any vessels visible (size, position, "
         f"   wakes, formations, direction of travel).\n"
-        f"3. Note any port infrastructure, anchorages, or mooring areas.\n"
-        f"4. Identify anything that could EXPLAIN or be CORRELATED with "
+        f"3. Analyze all the elements in the image and try to understand "
+        f"   whether any of them could plausibly be related to the anomaly.\n"
+        f"4. Note any port infrastructure, anchorages, or mooring areas.\n"
+        f"5. Identify anything that could EXPLAIN or be CORRELATED with "
         f"   the anomaly described above (e.g. a fleet heading toward the "
         f"   anomaly area, a congested port pushing traffic outward, "
         f"   unusual vessel clustering, oil spill traces, etc.).\n"
-        f"5. If nothing relevant is visible, say so clearly."
+        f"6. If nothing relevant is visible, say so clearly."
     )
 
     logger.info("Auto-analysing explored image %s", img.path)

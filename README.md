@@ -20,12 +20,12 @@ Input (lat, lon, timestamp)
         │
         ▼
 ┌─────────────────┐
-│ Image Processor  │   Windowed COG read → crop → PNG
+│ Image Processor │   Windowed COG read → crop → PNG
 └───────┬─────────┘
         │
         ▼
 ┌─────────────────┐
-│  Monitor Agent   │   gemma4:31b vision — per-image + temporal analysis
+│  Monitor Agent  │   qwen3.5 vision — per-image + temporal analysis
 └───────┬─────────┘
         │
    anomaly? ──no──► Report
@@ -34,7 +34,7 @@ Input (lat, lon, timestamp)
         │
         ▼
 ┌──────────────────┐
-│ Investigator Agent│   gemma4:31b tool-calling loop
+│ Investigator Agent │    qwen3.5 tool-calling loop
 │                    │   Tools: explore_direction, skip_direction,
 │                    │          analyze_image, submit_finding
 └───────┬────────────┘
@@ -54,7 +54,7 @@ Input (lat, lon, timestamp)
 
 ```bash
 # Clone / navigate to the project directory
-cd vlm-satellite-agent-2
+cd maritime-traffic-monitoring
 
 # Create a virtual environment (recommended)
 python -m venv .venv
@@ -131,7 +131,7 @@ environment variables:
 |------------------|------------------------------|------------------------------------|
 | `OLLAMA_API_KEY` | *(empty)*                    | Ollama Cloud API key (required)    |
 | `OLLAMA_HOST`    | `https://ollama.com`         | Ollama endpoint (cloud or local)   |
-| `VLM_MODEL`      | `gemma4:31b`                 | Model name for Ollama              |
+| `VLM_MODEL`      | `qwen3.5`                    | Model name for Ollama              |
 | `VLM_OUTPUT_DIR` | `./output`                   | Directory for final reports        |
 | `VLM_TEMP_DIR`   | `./tmp_images`               | Directory for downloaded imagery   |
 
@@ -156,7 +156,7 @@ fetching the entire ~110 km tile.
 
 ### 2. Monitor Agent
 
-The monitor sends all images to `gemma4:31b` as a temporal sequence and asks
+The monitor sends all images to `qwen3.5` as a temporal sequence and asks
 it to:
 - Count and locate vessels per image
 - Assess port and anchorage activity
@@ -191,7 +191,7 @@ any investigation findings, and the correlation analysis.
 - **10 m resolution**: vessels smaller than ~30 m may not be detectable
 - **Cloud cover**: maritime areas can have persistent cloud; some images may
   be partially occluded despite the filter
-- **VLM accuracy**: `gemma4:31b` is a general-purpose model, not fine-tuned
+- **VLM accuracy**: `qwen3.5` is a general-purpose model, not fine-tuned
   for maritime detection — appropriate for a PoC but not production use
 - **Revisit time**: Sentinel-2 revisits every ~5 days; the 3–5 images may
   span 2–4 weeks

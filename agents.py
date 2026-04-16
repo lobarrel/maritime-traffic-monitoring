@@ -64,6 +64,9 @@ After analysing all images individually, provide a TEMPORAL COMPARISON:
   - Is there any anomaly — something unusual, unexpected, or worth
     investigating?
 
+IMPORTANT: you are not allowed to use real historical events in your reasoning. 
+You are only allowed to use the images and the anomaly description to reason about the anomaly.
+
 You MUST end your response with a JSON block on its own line:
 ```json
 {
@@ -120,6 +123,9 @@ INVESTIGATION STRATEGY:
 Be selective and strategic — explore the most likely directions first.
 Do not explore directions that are clearly irrelevant.  Always justify
 your spatial reasoning.
+
+IMPORTANT: you are not allowed to use real historical events in your reasoning. 
+You are only allowed to use the images and the anomaly description to reason about the anomaly.
 """
 
 
