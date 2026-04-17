@@ -156,9 +156,9 @@ The model returns structured analysis ending with an anomaly verdict.
 If an anomaly is detected, the investigator agent is spawned with the anomaly
 context and access to these tools:
 
-- **explore_direction**: fetch and analyse imagery adjacent to the anomaly
-  along a compass bearing
-- **skip_direction**: record that a direction was not explored, with reasoning
+- **explore_direction**: fetch and analyse imagery adjacent to the anomaly (by default several recent Sentinel-2 dates of the same area for before/after comparison; optional `max_temporal_images=1` for a single pass)
+  along cardinal bearings **N, E, S, W** only (no diagonals)
+- **skip_direction**: record that a direction was not explored, with reasoning (same cardinal set)
 - **analyze_image**: ask the VLM a focused question about a specific image
 - **submit_finding**: record a conclusion with evidence and confidence level
 

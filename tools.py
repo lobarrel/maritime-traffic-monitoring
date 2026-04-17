@@ -26,10 +26,10 @@ skipped_directions: list[dict] = []
 # Coordinate helpers
 # ---------------------------------------------------------------------------
 
-_BEARING_DEG = {
-    "N": 0, "NE": 45, "E": 90, "SE": 135,
-    "S": 180, "SW": 225, "W": 270, "NW": 315,
-}
+# Cardinal directions only (no diagonals): N, E, S, W.
+EXPLORATION_DIRECTIONS: tuple[str, ...] = ("N", "E", "S", "W")
+_BEARING_DEG = {"N": 0, "E": 90, "S": 180, "W": 270}
+_EXPLORATION_DIR_LABEL = ", ".join(EXPLORATION_DIRECTIONS)
 
 
 def _offset_point(lat: float, lon: float, bearing_deg: float, distance_km: float) -> tuple[float, float]:
@@ -75,23 +75,27 @@ def explore_direction(
     direction: str,
     distance_km: float = 10.0,
     radius_km: float = 5.0,
+    max_temporal_images: int | None = None,
 ) -> str:
-    """Fetch and analyse a satellite image of an adjacent area in a given
+    """Fetch and analyse satellite image(s) of an adjacent area in a given
     compass direction from the anomaly location.
 
-    The tool fetches the most recent image, then automatically analyses it
-    for maritime activity that could be related to the detected anomaly.
-    It returns both the image path and a detailed visual analysis.
+    By default fetches multiple recent cloud-free passes (distinct dates,
+    newest-first) of the *same* AOI so you can compare how vessels traffic evolved over time.  
+    Use max_temporal_images=1 for a single snapshot only.
 
     Args:
-        direction: Compass direction to explore — one of N, NE, E, SE, S, SW, W, NW.
+        direction: Cardinal compass direction — one of N, E, S, W.
         distance_km: How far from the anomaly centre to look (default 10).
         radius_km: Radius of the area to fetch around the target point (default 5).
+        max_temporal_images: Number of distinct dates to retrieve (capped by
+            config.EXPLORE_TEMPORAL_MAX).  Defaults to config.EXPLORE_MAX_TEMPORAL_IMAGES.
+            Sentinel-2 revisit is typically every few days; each pass is one date.
     """
     direction = direction.upper().strip()
     bearing = _BEARING_DEG.get(direction)
     if bearing is None:
-        return f"Error: invalid direction '{direction}'. Use one of: {', '.join(_BEARING_DEG)}"
+        return f"Error: invalid direction '{direction}'. Use one of: {_EXPLORATION_DIR_LABEL}"
 
     target_lat, target_lon = _offset_point(_anchor_lat, _anchor_lon, bearing, distance_km)
 
@@ -101,12 +105,15 @@ def explore_direction(
     )
 
     ts = _anchor_timestamp or datetime.now(timezone.utc).isoformat()
+    n_frames = max_temporal_images if max_temporal_images is not None else config.EXPLORE_MAX_TEMPORAL_IMAGES
+    n_frames = max(1, min(int(n_frames), config.EXPLORE_TEMPORAL_MAX))
+
     images = prepare_images_for_vlm(
         lat=target_lat,
         lon=target_lon,
         timestamp=ts,
         radius_km=radius_km,
-        max_items=1,
+        max_items=n_frames,
         filename_prefix=f"explore_{direction}_",
     )
 
@@ -116,38 +123,67 @@ def explore_direction(
             f"({target_lat:.4f}, {target_lon:.4f})."
         )
 
-    img = images[0]
+    img_lines = []
+    for i, img in enumerate(images, 1):
+        img_lines.append(
+            f"  Image {i} (newest→oldest order): {img.path}  "
+            f"date={img.date}, cloud={img.cloud_cover}%"
+        )
     header = (
         f"Area {direction} of anomaly "
         f"(centre {target_lat:.4f}, {target_lon:.4f}, {distance_km} km away)\n"
-        f"Image: {img.path}  (date={img.date}, cloud={img.cloud_cover}%)\n"
+        f"Temporal frames requested: {n_frames}; distinct dates returned: {len(images)}\n"
+        + "\n".join(img_lines)
+        + "\n"
     )
 
-    analysis_prompt = (
-        f"You are examining a Sentinel-2 satellite image taken {direction} "
-        f"of a maritime anomaly location ({distance_km} km away).\n\n"
-        f"The detected anomaly is: {_anomaly_description}\n\n"
-        f"Analyse this image thoroughly:\n"
-        f"1. Is this area water, a canal, land, coastline, or a mix?\n"
-        f"2. Count and describe any vessels visible (size, position, "
-        f"   wakes, formations, direction of travel).\n"
-        f"3. Analyze all the elements in the image and try to understand "
-        f"   whether any of them could plausibly be related to the anomaly.\n"
-        f"4. Note any port infrastructure, anchorages, or mooring areas.\n"
-        f"5. Identify anything that could EXPLAIN or be CORRELATED with "
-        f"   the anomaly described above (e.g. a fleet heading toward the "
-        f"   anomaly area, a congested port pushing traffic outward, "
-        f"   unusual vessel clustering, oil spill traces, etc.).\n"
-        f"6. If nothing relevant is visible, say so clearly."
-    )
+    if len(images) == 1:
+        analysis_prompt = (
+            f"You are examining a Sentinel-2 satellite image taken {direction} "
+            f"of a maritime anomaly location ({distance_km} km away).\n\n"
+            f"The detected anomaly is: {_anomaly_description}\n\n"
+            f"Analyse this image thoroughly:\n"
+            f"1. Is this area water, a canal, land, coastline, or a mix?\n"
+            f"2. Count and describe any vessels visible (size, position, orientation, "
+            f"   wakes).\n"
+            f"3. Analyze all the elements in the image and try to understand "
+            f"   whether any of them could plausibly be related to the anomaly.\n"
+            f"4. Identify elements that could EXPLAIN or be CORRELATED with "
+            f"   the anomaly described above.\n"
+            f"5. If nothing relevant is visible, say so clearly."
+            f"IMPORTANT: you are not allowed to use real historical events in your reasoning. \n"
+            f"You are only allowed to use the images and the anomaly description to reason about the anomaly."
+        )
+    else:
+        analysis_prompt = (
+            f"You are examining a TIME SEQUENCE of Sentinel-2 images of the "
+            f"SAME geographic area, taken {direction} of a maritime anomaly "
+            f"location ({distance_km} km away).\n\n"
+            f"The images are attached in order from NEWEST (Image 1) to OLDEST "
+            f"(last image).  Compare chronologically from OLDEST to NEWEST "
+            f"to describe how the situation evolved.\n\n"
+            f"The detected anomaly is: {_anomaly_description}\n\n"
+            f"For EACH image, briefly note:\n"
+            f"  - Geographical context\n"
+            f"  - Vessels count, position, orientation, size, wakes.\n\n"
+            f"Then provide a TEMPORAL SYNTHESIS:\n"
+            f"  - How did the situation evolve over time?\n"
+            f"  - What elements could be related to the anomaly, and how?\n\n"
+            f"If the sequence is ambiguous, or cloud cover limits comparison, say so."
+            f"IMPORTANT: you are not allowed to use real historical events in your reasoning. \n"
+            f"You are only allowed to use the images and the anomaly description to reason about the anomaly."
+        )
 
-    logger.info("Auto-analysing explored image %s", img.path)
+    logger.info(
+        "Auto-analysing explored image(s) %s",
+        [img.path for img in images],
+    )
     response = config.get_client().chat(
         model=config.MODEL_NAME,
         messages=[{
             "role": "user",
             "content": analysis_prompt,
-            "images": [img.path],
+            "images": [img.path for img in images],
         }],
     )
 
@@ -164,10 +200,12 @@ def skip_direction(
     investigating.  This keeps the investigation transparent and focused.
 
     Args:
-        direction: Compass direction being skipped — one of N, NE, E, SE, S, SW, W, NW.
+        direction: Cardinal direction being skipped — one of N, E, S, W.
         reason: Brief explanation of why this direction is not relevant.
     """
     direction = direction.upper().strip()
+    if direction not in _BEARING_DEG:
+        return f"Error: invalid direction '{direction}'. Use one of: {_EXPLORATION_DIR_LABEL}"
     entry = {"direction": direction, "reason": reason}
     skipped_directions.append(entry)
     logger.info("Skipping direction %s: %s", direction, reason)

@@ -6,11 +6,17 @@ import json
 import logging
 import re
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 
 import config
 from image_processor import ImageData
-from tools import TOOL_REGISTRY, findings, skipped_directions, set_anchor
+from tools import (
+    EXPLORATION_DIRECTIONS,
+    TOOL_REGISTRY,
+    findings,
+    skipped_directions,
+    set_anchor,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -80,7 +86,9 @@ INVESTIGATOR_SYSTEM_PROMPT = """\
 You are a maritime anomaly investigator.  You have been alerted to an anomaly
 detected in Sentinel-2 satellite imagery.  Your job is to systematically
 explore the surrounding area to find events or activities that could explain
-or be correlated with the detected anomaly.
+or be correlated with the detected anomaly. Remember that the detected anomaly is 
+the effect, not the cause. The cause is what you are looking for. You must provide 
+a single, precise explanation for the anomaly.
 
 PLAUSIBLE CAUSES (non-exhaustive):
 Satellite-detected anomalies can reflect many unrelated phenomena.  Keep an open
@@ -95,13 +103,17 @@ Do not assume a single cause before you have explored the area; treat these
 as competing explanations until the evidence favours one.
 
 TOOLS:
-  - explore_direction(direction, distance_km (default 10), radius_km (default 5))
-        Fetch AND automatically analyse a satellite image of an adjacent
-        area in a compass direction (N, NE, E, SE, S, SW, W, NW).
-        Returns both the image path and a detailed visual analysis of
-        maritime activity, land features, vessels, and anything that could
-        be related to the anomaly.  You do NOT need to call analyze_image
-        afterwards — the analysis is already included.
+  - explore_direction(direction, distance_km (default 10), radius_km (default 5),
+        max_temporal_images (optional, default several recent dates))
+        Fetch AND automatically analyse satellite imagery of an adjacent area
+        in a cardinal direction (N, E, S, W only).  By default this
+        retrieves multiple recent cloud-free passes of the SAME patch (distinct
+        dates, newest-first) so you can compare vessel patterns before vs after
+        and temporally relate the observations to the anomaly.  Pass
+        max_temporal_images=1 if you only need a single snapshot.  Returns
+        image path(s) and a visual analysis (including a temporal synthesis
+        when multiple dates are present).  You do NOT need to call
+        analyze_image afterwards unless you need a follow-up question.
   - skip_direction(direction, reason)
         Explicitly record that you are NOT exploring a direction, and why.
   - analyze_image(image_path, question)
@@ -116,15 +128,18 @@ INVESTIGATION STRATEGY:
 1. First, reason about the anomaly and the geographic context. Carefully inspect 
    all the parts of the image where the anomaly is located (the most recent image)
    and try to find elements that could plausibly be related to the anomaly. 
-2. Consider what kind of activity in each of the 8 compass directions could plausibly
+2. Consider what kind of activity in each of the four cardinal directions could plausibly
    be related (shipping lanes, ports, coastline, anchorages, open ocean).
-   Decide which directions are WORTH exploring and which are NOT relevant.
-   For each direction you skip, call skip_direction with your reasoning.
+   Carefully decide which directions are WORTH exploring and which are NOT relevant.
+   For each direction you skip, call skip_direction with your reasoning. Be selective 
+   and strategic — explore the most likely directions first. Do not explore directions 
+   that are clearly irrelevant.  Always justify your spatial reasoning.
 3. For each promising direction, call explore_direction.  Read the returned
-   visual analysis carefully — it tells you what was found in the image.
-   If the analysis reveals something interesting that needs closer
-   inspection, you can call analyze_image on the same image.
-4. After gathering enough evidence, call submit_finding one or more times.
+   visual analysis carefully — when multiple dates are included, use the
+   temporal comparison to link cause (e.g. channel obstruction) and effect
+   (e.g. upstream/downstream accumulation).  If something needs closer
+   inspection, call analyze_image on one of the returned image paths.
+4. When you are confident that you have found a precise explanation, call submit_finding.
    Each finding must describe:
      - WHERE the evidence was found (direction and distance from anomaly)
      - WHAT was observed (vessels, port activity, formations, etc.)
@@ -136,12 +151,26 @@ You will receive a follow-up prompt for a formal conclusion; that response
 must commit to exactly ONE primary explanation for the anomaly (see that
 prompt).  Do not leave the investigation as only a list of possibilities.
 
-Be selective and strategic — explore the most likely directions first.
-Do not explore directions that are clearly irrelevant.  Always justify
-your spatial reasoning.
-
 IMPORTANT: you are not allowed to use real historical events in your reasoning. 
 You are only allowed to use the images and the anomaly description to reason about the anomaly.
+"""
+
+# Appended when native Ollama tools are unavailable (e.g. Gemini 3 cloud — ollama#14567).
+INVESTIGATOR_TEXT_TOOLS_SUFFIX = """
+TOOL INVOCATION (required when native function calling is not available):
+You cannot use server-side tool APIs. To run a tool, output one JSON object per tool
+on its own line (valid JSON only — no markdown fences). Shape:
+  {"name": "<tool_name>", "arguments": <object>}
+
+Examples:
+  {"name": "skip_direction", "arguments": {"direction": "N", "reason": "Open water only"}}
+  {"name": "explore_direction", "arguments": {"direction": "E", "distance_km": 10}}
+  {"name": "analyze_image", "arguments": {"image_path": "/path/from/tool/result", "question": "..."}}
+  {"name": "submit_finding", "arguments": {"title": "...", "description": "...", "evidence_images": "", "confidence": "medium"}}
+
+You may output several JSON lines in one turn if needed. After each batch, wait for
+tool results in the next message, then continue. Use only the tool names listed above.
+Tool results will appear as user messages beginning with ``[Tool result · <name>]``.
 """
 
 
@@ -167,17 +196,65 @@ def _extract_json_block(text: str) -> dict | None:
 
 
 def _parse_tool_calls_from_text(text: str) -> list[dict] | None:
-    """Fallback: extract tool-call JSON from model text when native parsing fails."""
-    pattern = r'\{\s*"name"\s*:\s*"(\w+)"\s*,\s*"arguments"\s*:\s*(\{[^}]+\})\s*\}'
-    matches = re.finditer(pattern, text, re.DOTALL)
-    calls = []
-    for m in matches:
+    """Extract ``{"name": ..., "arguments": {...}}`` objects (supports nested args)."""
+    decoder = json.JSONDecoder()
+    calls: list[dict] = []
+    i = 0
+    while i < len(text):
+        brace = text.find("{", i)
+        if brace == -1:
+            break
         try:
-            args = json.loads(m.group(2))
-            calls.append({"name": m.group(1), "arguments": args})
+            obj, end = decoder.raw_decode(text[brace:])
         except json.JSONDecodeError:
+            i = brace + 1
             continue
+        if isinstance(obj, dict) and isinstance(obj.get("name"), str):
+            args = obj.get("arguments", {})
+            if not isinstance(args, dict):
+                args = {}
+            calls.append({"name": obj["name"], "arguments": args})
+        i = brace + end
     return calls or None
+
+
+def _normalize_tool_call_for_exec(
+    tc: Any,
+    iteration: int,
+    index: int,
+) -> tuple[str, dict[str, Any], str | None]:
+    """Return (tool_name, arguments, call_id).  Name comes from ``name`` or ``function.name``."""
+    if isinstance(tc, dict):
+        call_id = tc.get("id")
+        fn = tc.get("function")
+        if isinstance(fn, dict):
+            name = (fn.get("name") or "").strip()
+            args = fn.get("arguments", {})
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except json.JSONDecodeError:
+                    args = {}
+        else:
+            name = (tc.get("name") or "").strip()
+            args = tc.get("arguments", {})
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except json.JSONDecodeError:
+                    args = {}
+        if not isinstance(args, dict):
+            args = {}
+        name = name or "unknown_tool"
+        if not call_id:
+            call_id = f"inv-{iteration}-{index}"
+        return name, args, call_id
+    name = (tc.function.name or "").strip() or "unknown_tool"
+    args = tc.function.arguments
+    if not isinstance(args, dict):
+        args = {}
+    call_id = getattr(tc, "id", None) or f"inv-{iteration}-{index}"
+    return name, args, call_id
 
 
 # ---------------------------------------------------------------------------
@@ -288,6 +365,14 @@ class InvestigatorAgent:
 
         set_anchor(lat, lon, timestamp, anomaly=monitor_report.anomaly_description)
 
+        self._native_tools = config.investigator_uses_native_tools(model)
+        system_content = INVESTIGATOR_SYSTEM_PROMPT
+        if not self._native_tools:
+            system_content = INVESTIGATOR_SYSTEM_PROMPT + "\n" + INVESTIGATOR_TEXT_TOOLS_SUFFIX
+            logger.info(
+                "InvestigatorAgent: using text-based tool protocol (native tools disabled for this model)"
+            )
+
         briefing = (
             f"ANOMALY BRIEFING\n"
             f"================\n"
@@ -298,9 +383,9 @@ class InvestigatorAgent:
             f"{monitor_report.temporal_summary}\n\n"
             f"AVAILABLE DIRECTIONS\n"
             f"--------------------\n"
-            f"The 8 compass directions from the anomaly centre are:\n"
-            f"  N  (north),  NE (northeast),  E  (east),  SE (southeast)\n"
-            f"  S  (south),  SW (southwest),  W  (west),  NW (northwest)\n\n"
+            f"You may only use explore_direction and skip_direction with these "
+            f"cardinal directions: {', '.join(EXPLORATION_DIRECTIONS)} "
+            f"(N=north, E=east, S=south, W=west).\n\n"
             f"Each explore_direction call fetches imagery ~15 km away in that\n"
             f"direction.  Decide which directions are worth investigating\n"
             f"based on the anomaly type and geographic context.  Skip the\n"
@@ -309,7 +394,7 @@ class InvestigatorAgent:
         )
 
         self.messages: list[dict] = [
-            {"role": "system", "content": INVESTIGATOR_SYSTEM_PROMPT},
+            {"role": "system", "content": system_content},
             {"role": "user", "content": briefing},
         ]
 
@@ -348,41 +433,45 @@ class InvestigatorAgent:
                 "max_iterations": self.max_iterations,
             })
 
-            response = config.get_client().chat(
+            tools_arg = tool_functions if self._native_tools else None
+            response = config.ollama_chat_raw_messages(
+                config.get_client(),
                 model=self.model,
-                messages=self.messages,
-                tools=tool_functions,
+                messages=config.normalize_ollama_chat_messages(self.messages),
+                tools=tools_arg,
             )
 
-            self.messages.append(response.message)
-
             reasoning = response.message.content or ""
+            parsed_native_fallback = False
+            tool_calls_list: Optional[list] = None
+
+            if self._native_tools:
+                assistant_dict = config.assistant_response_to_stored_dict(response.message)
+                config.ensure_tool_call_ids_on_assistant(assistant_dict)
+                self.messages.append(assistant_dict)
+                tool_calls_list = assistant_dict.get("tool_calls") or []
+                if not tool_calls_list and reasoning:
+                    parsed = _parse_tool_calls_from_text(reasoning)
+                    if parsed:
+                        logger.info("Recovered %d tool call(s) from text fallback", len(parsed))
+                        tool_calls_list = parsed
+                        parsed_native_fallback = True
+            else:
+                self.messages.append({"role": "assistant", "content": reasoning})
+                tool_calls_list = _parse_tool_calls_from_text(reasoning) if reasoning else None
+
             if reasoning:
                 _emit("investigator_reasoning", {
                     "iteration": iteration,
                     "content": reasoning,
                 })
 
-            tool_calls = response.message.tool_calls
-
-            # Fallback: try to parse tool calls from text if native parsing missed them
-            if not tool_calls and response.message.content:
-                parsed = _parse_tool_calls_from_text(response.message.content)
-                if parsed:
-                    logger.info("Recovered %d tool call(s) from text fallback", len(parsed))
-                    tool_calls = parsed
-
-            if not tool_calls:
+            if not tool_calls_list:
                 logger.info("InvestigatorAgent: no more tool calls — finishing")
                 break
 
-            for tc in tool_calls:
-                if isinstance(tc, dict):
-                    name = tc["name"]
-                    args = tc.get("arguments", {})
-                else:
-                    name = tc.function.name
-                    args = tc.function.arguments
+            for idx, tc in enumerate(tool_calls_list):
+                name, args, call_id = _normalize_tool_call_for_exec(tc, iteration, idx)
 
                 _emit("tool_call", {
                     "iteration": iteration,
@@ -391,10 +480,22 @@ class InvestigatorAgent:
                 })
 
                 result = self._execute_tool(name, args)
-                self.messages.append({
-                    "role": "tool",
-                    "content": result,
-                })
+
+                # Gemini pairs function_response to assistant tool_calls via tool_call_id.
+                # Text-style tool protocol (or native+text fallback) avoids role=tool entirely.
+                if self._native_tools and not parsed_native_fallback:
+                    self.messages.append({
+                        "role": "tool",
+                        "content": result,
+                        "name": name,
+                        "tool_name": name,
+                        "tool_call_id": call_id,
+                    })
+                else:
+                    self.messages.append({
+                        "role": "user",
+                        "content": f"[Tool result · {name}]\n{result}",
+                    })
 
                 _emit("tool_result", {
                     "iteration": iteration,
@@ -428,9 +529,14 @@ class InvestigatorAgent:
         )
         self.messages.append({"role": "user", "content": correlation_prompt})
 
-        response = config.get_client().chat(model=self.model, messages=self.messages)
+        response = config.ollama_chat_raw_messages(
+            config.get_client(),
+            model=self.model,
+            messages=config.normalize_ollama_chat_messages(self.messages),
+            tools=None,
+        )
         correlation_text = response.message.content
-        self.messages.append(response.message)
+        self.messages.append(config.assistant_response_to_stored_dict(response.message))
 
         report = InvestigationReport(
             findings=list(findings),
