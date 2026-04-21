@@ -15,6 +15,12 @@ Two pre-run analyses are included in the `examples/` folder, powered by differen
 
 To explore the results, launch the GUI and upload either of these .zip archive from the sidebar. This loads the full analysis session, where you can inspect the fetched imagery, the agent's step-by-step reasoning, and the final findings.
 
+<p align="center">
+  <img src="examples/snapshot1.png" alt="Use case snapshot 1" width="32%" />
+  <img src="examples/snapshot2.png" alt="Use case snapshot 2" width="32%" />
+  <img src="examples/snapshot3.png" alt="Use case snapshot 3" width="32%" />
+</p>
+
 
 ## Prerequisites
 
