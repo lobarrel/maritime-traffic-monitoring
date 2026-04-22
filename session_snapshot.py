@@ -378,4 +378,7 @@ def apply_manifest_to_session(
         fixed_steps.append(step)
     session_state["inv_steps"] = fixed_steps
 
+    session_state["__post_fetch_rerun"] = False
+    session_state["__run_agents_next"] = False
+
     session_state["snapshot_extract_dir"] = extract_root

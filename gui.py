@@ -93,6 +93,9 @@ _DEFAULTS = {
     "inv_steps": [],
     "pipeline_done": False,
     "error": None,
+    "pipeline_params": None,
+    "__run_agents_next": False,
+    "__post_fetch_rerun": False,
     "lat": 29.89,
     "lon": 32.54,
     "radius_km": config.SEARCH_RADIUS_KM,
@@ -111,6 +114,9 @@ _PIPELINE_STATE_DEFAULTS = {
     "inv_steps": [],
     "pipeline_done": False,
     "error": None,
+    "pipeline_params": None,
+    "__run_agents_next": False,
+    "__post_fetch_rerun": False,
 }
 
 for key, default in _DEFAULTS.items():
@@ -140,6 +146,9 @@ def _reset_session() -> None:
         st.session_state[key] = default
     st.session_state["snap_ts"] = DEFAULT_SNAPSHOT_DATE
     st.session_state.pop("_loaded_snap_digest", None)
+    st.session_state["__run_agents_next"] = False
+    st.session_state["__post_fetch_rerun"] = False
+    st.session_state["pipeline_params"] = None
 
 
 # ---------------------------------------------------------------------------
@@ -326,44 +335,15 @@ def render_findings(findings: list[dict]) -> None:
 # Pipeline execution
 # ---------------------------------------------------------------------------
 
-def run_pipeline(
+def _run_monitor_and_investigation(
     lat: float,
     lon: float,
     timestamp_str: str,
-    radius_km: float,
-    max_cloud: int,
-    max_images: int,
 ) -> None:
-    """Run the full pipeline, writing results to session state and updating
-    Streamlit containers live as steps complete."""
-
-    st.session_state.update(_PIPELINE_STATE_DEFAULTS)
-
-    # -- Step 1: fetch imagery -----------------------------------------------
-    with st.status("Fetching Sentinel-2 imagery...", expanded=True) as status:
-        st.write(f"Searching {config.STAC_API_URL}")
-        st.write(f"Centre: ({lat:.4f}, {lon:.4f})  Radius: {radius_km} km  Cloud <= {max_cloud}%")
-
-        images = prepare_images_for_vlm(
-            lat, lon, timestamp_str,
-            radius_km=radius_km,
-            max_items=max_images,
-            max_cloud_cover=max_cloud,
-        )
-
-        if not images:
-            status.update(label="No imagery found", state="error")
-            st.session_state["error"] = (
-                "No cloud-free Sentinel-2 imagery found within the 90-day "
-                "search window.  Try increasing the cloud cover threshold "
-                "or changing the date."
-            )
-            return
-
-        st.write(f"Retrieved **{len(images)}** image(s)")
-        status.update(label=f"Fetched {len(images)} images", state="complete")
-
-    st.session_state["images"] = images
+    """Run monitor + investigator. Expects ``st.session_state['images']`` to be set."""
+    images = st.session_state.get("images") or []
+    if not images:
+        return
 
     # -- Step 2: monitor agent -----------------------------------------------
     monitor_placeholder = st.empty()
@@ -416,6 +396,52 @@ def run_pipeline(
     st.session_state["pipeline_done"] = True
 
 
+def run_pipeline(
+    lat: float,
+    lon: float,
+    timestamp_str: str,
+    radius_km: float,
+    max_cloud: int,
+    max_images: int,
+) -> None:
+    """Fetch imagery. The main area shows the gallery in the same run; a follow-up
+    rerun runs the monitor / investigator so the gallery is visible before LLM work."""
+
+    st.session_state.update(_PIPELINE_STATE_DEFAULTS)
+
+    # -- Step 1: fetch imagery -----------------------------------------------
+    with st.status("Fetching Sentinel-2 imagery...", expanded=True) as status:
+        st.write(f"Searching {config.STAC_API_URL}")
+        st.write(f"Centre: ({lat:.4f}, {lon:.4f})  Radius: {radius_km} km  Cloud <= {max_cloud}%")
+
+        images = prepare_images_for_vlm(
+            lat, lon, timestamp_str,
+            radius_km=radius_km,
+            max_items=max_images,
+            max_cloud_cover=max_cloud,
+        )
+
+        if not images:
+            status.update(label="No imagery found", state="error")
+            st.session_state["error"] = (
+                "No cloud-free Sentinel-2 imagery found within the 90-day "
+                "search window.  Try increasing the cloud cover threshold "
+                "or changing the date."
+            )
+            return
+
+        st.write(f"Retrieved **{len(images)}** image(s)")
+        status.update(label=f"Fetched {len(images)} images", state="complete")
+
+    st.session_state["images"] = images
+    st.session_state["pipeline_params"] = {
+        "lat": lat,
+        "lon": lon,
+        "timestamp_str": timestamp_str,
+    }
+    st.session_state["__post_fetch_rerun"] = True
+
+
 # ---------------------------------------------------------------------------
 # Main content area
 # ---------------------------------------------------------------------------
@@ -454,8 +480,6 @@ if st.session_state["error"]:
     st.error(st.session_state["error"])
 
 images = st.session_state["images"]
-monitor_report = st.session_state["monitor_report"]
-investigation_report = st.session_state["investigation_report"]
 
 # -- Image gallery -----------------------------------------------------------
 if images:
@@ -472,6 +496,22 @@ if images:
     metric_cols[3].metric("Resolution", "10 m/px")
 
     render_image_gallery(images)
+
+# Continue pipeline after a fast rerun (images visible before LLM work).
+if st.session_state.pop("__run_agents_next", False):
+    p = st.session_state.get("pipeline_params") or {}
+    key = st.session_state.get("api_key", "")
+    host = st.session_state.get("ollama_host", config.OLLAMA_HOST)
+    if p and (key or host != "https://ollama.com"):
+        config.get_client(api_key=key, host=host)
+        _run_monitor_and_investigation(
+            p["lat"],
+            p["lon"],
+            p["timestamp_str"],
+        )
+
+monitor_report = st.session_state["monitor_report"]
+investigation_report = st.session_state["investigation_report"]
 
 # -- Monitor report ----------------------------------------------------------
 if monitor_report:
@@ -587,3 +627,8 @@ if st.session_state["pipeline_done"]:
             "Restores the full dashboard, not a static web page.",
             use_container_width=True,
         )
+
+# Defer agents to the next run so the browser can show the fetched gallery first.
+if st.session_state.pop("__post_fetch_rerun", False) and st.session_state.get("images"):
+    st.session_state["__run_agents_next"] = True
+    st.rerun()
